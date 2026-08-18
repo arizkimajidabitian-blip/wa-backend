@@ -23,7 +23,7 @@ let sock;
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  sock = makeWASocket({ auth: state, printQRInTerminal: false });
+  sock = makeWASocket({ auth: state, printQRInTerminal: true });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -37,15 +37,27 @@ async function connectToWhatsApp() {
     }
 
     if (connection === 'open') {
-      io.emit('status', 'Terhubung ke WhatsApp!');
+      io.emit('status', 'Terhubung');
       io.emit('qr', null);
     }
 
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      io.emit('status', 'Koneksi terputus. Menghubungkan ulang...');
+      io.emit('status', 'Terputus. Menghubungkan ulang...');
       if (shouldReconnect) connectToWhatsApp();
+    }
+  });
+
+  // Mendengarkan pesan masuk
+  sock.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages[0];
+    if (!msg.key.fromMe && m.type === 'notify') {
+      const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '');
+      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+      if (text) {
+        io.emit('incoming-message', { from: sender, text });
+      }
     }
   });
 }
@@ -53,7 +65,6 @@ async function connectToWhatsApp() {
 app.post('/send-message', async (req, res) => {
   const { number, message } = req.body;
   if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap' });
-  if (!number || !message) return res.status(400).json({ status: false, message: 'Isi nomor dan pesan' });
 
   try {
     let cleanedNumber = number.replace(/[^0-9]/g, '');
@@ -61,18 +72,13 @@ app.post('/send-message', async (req, res) => {
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
     
     await sock.sendMessage(recipientJid, { text: message });
-    res.json({ status: true, message: 'Pesan berhasil terkirim!' });
+    res.json({ status: true, message: 'Terkirim' });
   } catch (err) {
     res.status(500).json({ status: false, message: err.message });
   }
 });
 
-io.on('connection', (socket) => {
-  socket.emit('status', 'Terhubung ke Gateway Server');
-});
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server WA Gateway aktif di port ${PORT}`);
   connectToWhatsApp();
 });

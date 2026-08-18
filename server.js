@@ -23,7 +23,11 @@ let sock;
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  sock = makeWASocket({ auth: state, printQRInTerminal: true });
+  sock = makeWASocket({ 
+    auth: state, 
+    printQRInTerminal: true,
+    syncFullHistory: true // Mengaktifkan sinkronisasi riwayat pesan lama
+  });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -49,14 +53,32 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Mendengarkan pesan masuk
+  // Tangkap riwayat pesan lama saat pertama kali terhubung (History Sync)
+  sock.ev.on('messaging-history.set', ({ messages }) => {
+    messages.forEach(msg => {
+      if (!msg.key || !msg.key.remoteJid) return;
+      const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+      const fromMe = msg.key.fromMe || false;
+
+      if (text) {
+        io.emit('history-message', { from: sender, text, fromMe });
+      }
+    });
+  });
+
+  // Mendengarkan pesan baru yang masuk secara real-time
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
-    if (!msg.key.fromMe && m.type === 'notify') {
-      const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '');
+    if (!msg || !msg.key || !msg.message) return;
+    
+    if (m.type === 'notify') {
+      const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+      const fromMe = msg.key.fromMe || false;
+
       if (text) {
-        io.emit('incoming-message', { from: sender, text });
+        io.emit('incoming-message', { from: sender, text, fromMe });
       }
     }
   });

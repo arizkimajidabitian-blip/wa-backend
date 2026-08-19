@@ -16,22 +16,27 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
-// KONEKSI MONGO DB
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:rahasia123@cluster0.abcde.mongodb.net/wagateway?retryWrites=true&w=majority";
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully'))
   .catch(err => console.error('MongoDB Connection Error:', err));
 
-// Schema Model Pesan
-// 'chatJid' menyimpan nomor lawan bicara (selalu nomor teman chat, bukan nomor kita)
+// Schema Pesan
 const MessageSchema = new mongoose.Schema({
-  chatJid: String,   // Contoh: '628123456789'
+  chatJid: String,
   text: String,
   fromMe: Boolean,
   timestamp: { type: Date, default: Date.now }
 });
 const Message = mongoose.model('Message', MessageSchema);
+
+// Schema Kontak (Baru!)
+const ContactSchema = new mongoose.Schema({
+  jid: { type: String, unique: true }, // Contoh: 628123456789
+  name: String
+});
+const Contact = mongoose.model('Contact', ContactSchema);
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -78,19 +83,59 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Mendengarkan dan menyimpan pesan masuk/keluar dari WhatsApp
+  // 1. Simpan Kontak dari Sinkronisasi Awal WA (Saat Scan)
+  sock.ev.on('messaging-history.set', async ({ contacts }) => {
+    if (contacts && contacts.length > 0) {
+      for (const c of contacts) {
+        const cleaned = cleanNumber(c.id);
+        const name = c.name || c.notify || c.verifiedName;
+        if (cleaned && name) {
+          await Contact.findOneAndUpdate(
+            { jid: cleaned },
+            { name },
+            { upsert: true, new: true }
+          );
+        }
+      }
+      io.emit('contacts-updated');
+    }
+  });
+
+  // 2. Simpan Kontak yang Baru Masuk/Diupdate
+  sock.ev.on('contacts.upsert', async (contacts) => {
+    for (const c of contacts) {
+      const cleaned = cleanNumber(c.id);
+      const name = c.name || c.notify || c.verifiedName;
+      if (cleaned && name) {
+        await Contact.findOneAndUpdate(
+          { jid: cleaned },
+          { name },
+          { upsert: true, new: true }
+        );
+      }
+    }
+    io.emit('contacts-updated');
+  });
+
+  // 3. Simpan Pesan dan Nama Pengirim
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
-
-    // Abaikan pesan status/story
     if (msg.key.remoteJid === 'status@broadcast') return;
 
     const remoteJid = msg.key.remoteJid || '';
     const chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
 
-    // Ambil teks dari berbagai jenis pesan Teks / Balasan / Web
+    // Jika pesan membawa nama pushName/notifyName pengirim, simpan ke Kontak
+    if (msg.pushName && chatJid) {
+      await Contact.findOneAndUpdate(
+        { jid: chatJid },
+        { name: msg.pushName },
+        { upsert: true }
+      );
+    }
+
     const text = 
       msg.message?.conversation || 
       msg.message?.extendedTextMessage?.text || 
@@ -99,11 +144,8 @@ async function connectToWhatsApp() {
 
     if (text && chatJid) {
       try {
-        // Simpan ke MongoDB dengan chatJid lawan bicara
         await Message.create({ chatJid, text, fromMe });
-
-        // Broadcast real-time via Socket.IO ke Frontend
-        io.emit('incoming-message', { chatJid, text, fromMe });
+        io.emit('incoming-message', { chatJid, text, fromMe, pushName: msg.pushName });
       } catch (err) {
         console.error('Gagal simpan pesan:', err);
       }
@@ -111,7 +153,16 @@ async function connectToWhatsApp() {
   });
 }
 
-// Endpoint Ambil Seluruh Riwayat Pesan dari Database
+// Endpoint Ambil Daftar Kontak
+app.get('/contacts', async (req, res) => {
+  try {
+    const contacts = await Contact.find();
+    res.json(contacts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   try {
     const history = await Message.find().sort({ timestamp: 1 });
@@ -121,7 +172,6 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// Endpoint Kirim Pesan
 app.post('/send-message', async (req, res) => {
   const { number, message } = req.body;
   if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap / terhubung' });
@@ -130,9 +180,7 @@ app.post('/send-message', async (req, res) => {
     const cleanedNumber = cleanNumber(number);
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
     
-    // Kirim via Baileys (nanti disimpen otomatis lewat event messages.upsert dari WA)
     await sock.sendMessage(recipientJid, { text: message });
-
     res.json({ status: true, message: 'Terkirim' });
   } catch (err) {
     res.status(500).json({ status: false, message: err.message });

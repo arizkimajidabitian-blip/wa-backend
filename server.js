@@ -13,8 +13,8 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-// Pengaturan CORS & JSON Middleware
-app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
+// Middleware CORS & Parser Body
+app.use(cors({ origin: "*", methods: ["GET", "POST", "DELETE"] }));
 app.use(express.json());
 
 // Mengambil variabel MONGO_URI dari Environment Railway
@@ -24,7 +24,7 @@ if (!MONGO_URI) {
   console.error("FATAL ERROR: MONGO_URI belum di-set di Environment Variables Railway!");
 }
 
-// Koneksi ke MongoDB Atlas
+// Koneksi ke Database MongoDB Atlas
 mongoose.connect(MONGO_URI)
   .then(() => console.log('MongoDB Atlas Connected Successfully'))
   .catch(err => console.error('MongoDB Connection Error:', err));
@@ -39,8 +39,9 @@ const MessageSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', MessageSchema);
 
 const ContactSchema = new mongoose.Schema({
-  jid: { type: String, unique: true },
-  name: String
+  jid: { type: String, unique: true, required: true },
+  name: { type: String, required: true },
+  custom: { type: Boolean, default: false }
 });
 const Contact = mongoose.model('Contact', ContactSchema);
 
@@ -52,15 +53,15 @@ const StorySchema = new mongoose.Schema({
 });
 const Story = mongoose.model('Story', StorySchema);
 
-// Inisialisasi Socket.IO Server
+// Inisialisasi Socket.IO
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 let sock;
-let lastQR = null; // Penampung QR Code Instan (Base64)
+let lastQR = null;
 
-// Fungsi Sanitasi dan Normalisasi Nomor Telepon
+// Fungsi Format dan Sanitasi Nomor Telepon
 function cleanNumber(jidOrNumber) {
   if (!jidOrNumber) return '';
   let cleaned = jidOrNumber.replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/[^0-9]/g, '');
@@ -68,7 +69,7 @@ function cleanNumber(jidOrNumber) {
   return cleaned;
 }
 
-// Fungsi Utama Koneksi WhatsApp (Baileys)
+// Koneksi Utama WhatsApp dengan Baileys
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   
@@ -81,7 +82,7 @@ async function connectToWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Update Status Koneksi & QR Code
+  // Penanganan Status Koneksi dan QR Code
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -96,10 +97,10 @@ async function connectToWhatsApp() {
     }
 
     if (connection === 'open') {
-      lastQR = null; // Hapus penampung QR jika sudah terkoneksi
+      lastQR = null;
       io.emit('status', 'Terhubung');
       io.emit('qr', null);
-      console.log('WhatsApp Gateway Online & Terhubung!');
+      console.log('WhatsApp Gateway Online!');
     }
 
     if (connection === 'close') {
@@ -113,7 +114,7 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Sinkronisasi Riwayat Chat & Kontak Otomatis Saat Pertama Kali Login
+  // Sinkronisasi History Chat dan Kontak Pertama Kali
   sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
     try {
       if (contacts && contacts.length > 0) {
@@ -121,7 +122,11 @@ async function connectToWhatsApp() {
           const cleaned = cleanNumber(c.id);
           const name = c.name || c.notify || c.verifiedName;
           if (cleaned && name) {
-            await Contact.findOneAndUpdate({ jid: cleaned }, { name }, { upsert: true });
+            await Contact.findOneAndUpdate(
+              { jid: cleaned }, 
+              { $setOnInsert: { name, custom: false } }, 
+              { upsert: true }
+            );
           }
         }
       }
@@ -148,26 +153,30 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Penambahan Kontak Baru Secara Otomatis
+  // Penambahan Kontak Bawaan Secara Otomatis
   sock.ev.on('contacts.upsert', async (contacts) => {
     for (const c of contacts) {
       const cleaned = cleanNumber(c.id);
       const name = c.name || c.notify || c.verifiedName;
       if (cleaned && name) {
-        await Contact.findOneAndUpdate({ jid: cleaned }, { name }, { upsert: true });
+        await Contact.findOneAndUpdate(
+          { jid: cleaned },
+          { $setOnInsert: { name, custom: false } },
+          { upsert: true }
+        );
       }
     }
     io.emit('contacts-updated');
   });
 
-  // Penanganan Pesan Masuk & Status/Story WhatsApp
+  // Event Pesan Masuk & Capture Story WA
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
 
     const remoteJid = msg.key.remoteJid || '';
-    
-    // Fitur Tangkap Status / Story WA Orang Lain
+
+    // Menangkap Story / Status WA
     if (remoteJid === 'status@broadcast') {
       const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
       const senderName = msg.pushName || senderJid;
@@ -192,13 +201,16 @@ async function connectToWhatsApp() {
       msg.message?.extendedTextMessage?.text || 
       msg.message?.imageMessage?.caption || '';
 
-    // Simpan Kontak Jika Ada PushName
+    // Otomatis Simpan Nama Kontak dari PushName Pesan
     if (msg.pushName && chatJid) {
-      await Contact.findOneAndUpdate({ jid: chatJid }, { name: msg.pushName }, { upsert: true });
-      io.emit('contacts-updated');
+      const existing = await Contact.findOne({ jid: chatJid });
+      if (!existing) {
+        await Contact.create({ jid: chatJid, name: msg.pushName, custom: false });
+        io.emit('contacts-updated');
+      }
     }
 
-    // Simpan Pesan ke DB & Broadcast Real-Time ke Frontend
+    // Simpan Pesan ke DB Atlas dan Broadcast Realtime
     if (text && chatJid) {
       try {
         const saved = await Message.create({ chatJid, text, fromMe });
@@ -242,37 +254,60 @@ io.on('connection', (socket) => {
 
 // ================= REST API ENDPOINTS =================
 
-// Get Semua Daftar Kontak
+// Endpoint Ambil Semua Kontak
 app.get('/contacts', async (req, res) => {
   try {
-    const contacts = await Contact.find();
+    const contacts = await Contact.find().sort({ name: 1 });
     res.json(contacts);
   } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+    res.status(500).json([]); 
   }
 });
 
-// Get Semua Riwayat Pesan
+// Endpoint Tambah Kontak Manual Permanen ke MongoDB Atlas
+app.post('/contacts', async (req, res) => {
+  try {
+    const { number, name } = req.body;
+    let cleaned = cleanNumber(number);
+
+    if (!cleaned || !name) {
+      return res.status(400).json({ status: false, message: 'Nomor dan nama wajib diisi!' });
+    }
+
+    const contact = await Contact.findOneAndUpdate(
+      { jid: cleaned },
+      { name, custom: true },
+      { upsert: true, new: true }
+    );
+
+    io.emit('contacts-updated');
+    res.json({ status: true, contact });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// Endpoint Ambil Semua Riwayat Pesan
 app.get('/messages', async (req, res) => {
   try {
     const history = await Message.find().sort({ timestamp: 1 });
     res.json(history);
   } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+    res.status(500).json([]); 
   }
 });
 
-// Get Riwayat Story / Status WA
+// Endpoint Ambil Riwayat Story
 app.get('/stories', async (req, res) => {
   try {
     const stories = await Story.find().sort({ timestamp: -1 }).limit(30);
     res.json(stories);
   } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+    res.status(500).json([]); 
   }
 });
 
-// Endpoint Kirim Pesan
+// Endpoint Kirim Pesan WA
 app.post('/send-message', async (req, res) => {
   const { number, message } = req.body;
 
@@ -291,10 +326,10 @@ app.post('/send-message', async (req, res) => {
     // Kirim via Baileys
     await sock.sendMessage(recipientJid, { text: message });
 
-    // Simpan ke DB
+    // Simpan ke DB Atlas
     const saved = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
 
-    // Broadcast Real-Time ke Semua Klien (HP & PC)
+    // Broadcast Realtime ke Seluruh Klien (PC & HP)
     io.emit('incoming-message', { 
       chatJid: cleanedNumber, 
       text: message, 
@@ -309,7 +344,7 @@ app.post('/send-message', async (req, res) => {
   }
 });
 
-// Menjalankan HTTP & Socket Server
+// Jalankan Server HTTP & Socket
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server Gateway Aktif di Port: ${PORT}`);

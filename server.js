@@ -56,11 +56,18 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 let sock;
 let lastQR = null;
 
-function cleanNumber(jidOrNumber) {
-  if (!jidOrNumber) return '';
-  let cleaned = jidOrNumber.toString().split('@')[0].replace(/[^0-9]/g, '');
+function parseJid(jidOrNumber) {
+  if (!jidOrNumber) return { cleanJid: '', isGroup: false };
+  let str = jidOrNumber.toString().trim();
+  
+  if (str.endsWith('@g.us')) {
+    return { cleanJid: str, isGroup: true };
+  }
+  
+  let cleaned = str.split('@')[0].replace(/[^0-9]/g, '');
   if (cleaned.startsWith('0')) cleaned = '62' + cleaned.slice(1);
-  return cleaned;
+  
+  return { cleanJid: cleaned, isGroup: false };
 }
 
 async function connectToWhatsApp() {
@@ -101,44 +108,49 @@ async function connectToWhatsApp() {
     }
   });
 
-  // TANGKAP SEMUA PESAN MASUK DARI SIAPAPUN (BARU ATAU LAMA)
   sock.ev.on('messages.upsert', async (m) => {
     try {
       const msg = m.messages[0];
       if (!msg || !msg.message) return;
 
-      const remoteJid = msg.key.remoteJid || '';
-      if (remoteJid.includes('status@broadcast')) return; // Abaikan story
+      const rawJid = msg.key.remoteJid || '';
+      if (rawJid.includes('status@broadcast')) return;
 
-      const chatJid = cleanNumber(remoteJid);
-      if (!chatJid) return;
+      const { cleanJid, isGroup } = parseJid(rawJid);
+      if (!cleanJid) return;
 
       const fromMe = msg.key.fromMe || false;
 
-      // Ekstraksi Teks Pesan (Support Berbagai Format Pesan WA)
       const text = 
         msg.message.conversation || 
         msg.message.extendedTextMessage?.text || 
         msg.message.imageMessage?.caption || 
-        msg.message.videoMessage?.caption || 
-        msg.message.buttonsResponseMessage?.selectedButtonId ||
-        msg.message.listResponseMessage?.singleSelectReply?.selectedRowId || '';
+        msg.message.videoMessage?.caption || '';
 
-      if (!text) return; // Jika pesan kosong (misal stiker/audio), abaikan agar tidak error
+      if (!text) return;
 
-      // 1. Auto-save Kontak Baru Jika Ada Orang Asing Mengirim Pesan
-      const pushName = msg.pushName || chatJid;
-      let existingContact = memoryContacts.find(c => c.jid === chatJid);
-      
+      let chatName = cleanJid;
+      if (isGroup) {
+        try {
+          const groupMeta = await sock.groupMetadata(cleanJid);
+          chatName = groupMeta.subject || cleanJid;
+        } catch (e) {
+          chatName = 'Grup WA';
+        }
+      } else {
+        chatName = msg.pushName || cleanJid;
+      }
+
+      let existingContact = memoryContacts.find(c => c.jid === cleanJid);
       if (!existingContact) {
-        const newContact = { jid: chatJid, name: pushName, custom: false };
+        const newContact = { jid: cleanJid, name: chatName, custom: false };
         memoryContacts.push(newContact);
         
         if (isDbConnected) {
           try {
             await Contact.findOneAndUpdate(
-              { jid: chatJid },
-              { jid: chatJid, name: pushName, custom: false },
+              { jid: cleanJid },
+              { jid: cleanJid, name: chatName, custom: false },
               { upsert: true }
             );
           } catch (e) {}
@@ -146,20 +158,20 @@ async function connectToWhatsApp() {
         io.emit('contacts-updated');
       }
 
-      // 2. Simpan Pesan Masuk
-      const msgObj = { chatJid, text, fromMe, timestamp: new Date() };
-      memoryMessages.push(msgObj);
-
+      const msgObj = { _id: new mongoose.Types.ObjectId().toString(), chatJid: cleanJid, text, fromMe, timestamp: new Date() };
+      
       if (isDbConnected) {
-        try { await Message.create(msgObj); } catch(e){}
+        try { 
+          const saved = await Message.create({ chatJid: cleanJid, text, fromMe });
+          msgObj._id = saved._id.toString();
+        } catch(e){}
       }
 
-      // Broadcast pesan secara instant ke Frontend
+      memoryMessages.push(msgObj);
       io.emit('incoming-message', msgObj);
-      console.log(`[Pesan Masuk] Dari ${chatJid}: ${text}`);
 
     } catch (err) {
-      console.error('Error handling messages.upsert:', err);
+      console.error('Error messages.upsert:', err);
     }
   });
 }
@@ -186,7 +198,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// ================= API ENDPOINTS =================
+// ================= REST API ENDPOINTS =================
 
 app.get('/contacts', async (req, res) => {
   if (isDbConnected) {
@@ -200,27 +212,25 @@ app.get('/contacts', async (req, res) => {
 
 app.post('/contacts', async (req, res) => {
   const { number, name } = req.body;
-  let cleaned = cleanNumber(number);
+  const { cleanJid } = parseJid(number);
 
-  if (!cleaned || !name) {
+  if (!cleanJid || !name) {
     return res.status(400).json({ status: false, message: 'Nomor dan nama wajib diisi!' });
   }
 
-  const contactObj = { jid: cleaned, name, custom: true };
+  const contactObj = { jid: cleanJid, name, custom: true };
 
-  memoryContacts = memoryContacts.filter(c => c.jid !== cleaned);
+  memoryContacts = memoryContacts.filter(c => c.jid !== cleanJid);
   memoryContacts.push(contactObj);
 
   if (isDbConnected) {
     try {
       await Contact.findOneAndUpdate(
-        { jid: cleaned },
-        { jid: cleaned, name, custom: true },
+        { jid: cleanJid },
+        { jid: cleanJid, name, custom: true },
         { upsert: true }
       );
-    } catch (err) {
-      console.error("Gagal simpan DB Atlas:", err.message);
-    }
+    } catch (err) {}
   }
 
   io.emit('contacts-updated');
@@ -245,24 +255,56 @@ app.post('/send-message', async (req, res) => {
   }
 
   try {
-    let cleanedNumber = cleanNumber(number);
-    if (!cleanedNumber) return res.status(400).json({ status: false, message: 'Nomor tidak valid' });
+    const { cleanJid, isGroup } = parseJid(number);
+    if (!cleanJid) return res.status(400).json({ status: false, message: 'Nomor/JID tidak valid' });
 
-    const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
+    const recipientJid = isGroup ? cleanJid : `${cleanJid}@s.whatsapp.net`;
     await sock.sendMessage(recipientJid, { text: message });
 
-    const msgObj = { chatJid: cleanedNumber, text: message, fromMe: true, timestamp: new Date() };
-    memoryMessages.push(msgObj);
+    const msgObj = { _id: new mongoose.Types.ObjectId().toString(), chatJid: cleanJid, text: message, fromMe: true, timestamp: new Date() };
 
     if (isDbConnected) {
-      try { await Message.create(msgObj); } catch(e){}
+      try { 
+        const saved = await Message.create({ chatJid: cleanJid, text: message, fromMe: true }); 
+        msgObj._id = saved._id.toString();
+      } catch(e){}
     }
 
+    memoryMessages.push(msgObj);
     io.emit('incoming-message', msgObj);
     res.json({ status: true, message: 'Terkirim' });
   } catch (err) {
     res.status(500).json({ status: false, message: err.message });
   }
+});
+
+// FITUR BARU: HAPUS SEMUA CHAT BERDASARKAN KONTAK
+app.delete('/chat/:jid', async (req, res) => {
+  const { jid } = req.params;
+  const { cleanJid } = parseJid(jid);
+
+  memoryMessages = memoryMessages.filter(m => m.chatJid !== cleanJid);
+
+  if (isDbConnected) {
+    try { await Message.deleteMany({ chatJid: cleanJid }); } catch(err){}
+  }
+
+  io.emit('messages-deleted', { chatJid: cleanJid });
+  res.json({ status: true, message: 'Chat berhasil dihapus' });
+});
+
+// FITUR BARU: HAPUS SPESIFIK SATU PESAN BY ID
+app.delete('/messages/:id', async (req, res) => {
+  const { id } = req.params;
+
+  memoryMessages = memoryMessages.filter(m => m._id !== id);
+
+  if (isDbConnected) {
+    try { await Message.findByIdAndDelete(id); } catch(err){}
+  }
+
+  io.emit('message-single-deleted', { id });
+  res.json({ status: true, message: 'Pesan berhasil dihapus' });
 });
 
 const PORT = process.env.PORT || 3000;

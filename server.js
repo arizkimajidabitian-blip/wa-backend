@@ -19,8 +19,6 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI;
 
 let isDbConnected = false;
-
-// Penampung Cadangan (In-Memory Fallback)
 let memoryContacts = [];
 let memoryMessages = [];
 
@@ -60,7 +58,7 @@ let lastQR = null;
 
 function cleanNumber(jidOrNumber) {
   if (!jidOrNumber) return '';
-  let cleaned = jidOrNumber.toString().replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/[^0-9]/g, '');
+  let cleaned = jidOrNumber.toString().split('@')[0].replace(/[^0-9]/g, '');
   if (cleaned.startsWith('0')) cleaned = '62' + cleaned.slice(1);
   return cleaned;
 }
@@ -103,18 +101,52 @@ async function connectToWhatsApp() {
     }
   });
 
+  // TANGKAP SEMUA PESAN MASUK DARI SIAPAPUN (BARU ATAU LAMA)
   sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg || !msg.key || !msg.message) return;
+    try {
+      const msg = m.messages[0];
+      if (!msg || !msg.message) return;
 
-    const remoteJid = msg.key.remoteJid || '';
-    if (remoteJid === 'status@broadcast') return;
+      const remoteJid = msg.key.remoteJid || '';
+      if (remoteJid.includes('status@broadcast')) return; // Abaikan story
 
-    let chatJid = cleanNumber(remoteJid);
-    const fromMe = msg.key.fromMe || false;
-    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+      const chatJid = cleanNumber(remoteJid);
+      if (!chatJid) return;
 
-    if (text && chatJid) {
+      const fromMe = msg.key.fromMe || false;
+
+      // Ekstraksi Teks Pesan (Support Berbagai Format Pesan WA)
+      const text = 
+        msg.message.conversation || 
+        msg.message.extendedTextMessage?.text || 
+        msg.message.imageMessage?.caption || 
+        msg.message.videoMessage?.caption || 
+        msg.message.buttonsResponseMessage?.selectedButtonId ||
+        msg.message.listResponseMessage?.singleSelectReply?.selectedRowId || '';
+
+      if (!text) return; // Jika pesan kosong (misal stiker/audio), abaikan agar tidak error
+
+      // 1. Auto-save Kontak Baru Jika Ada Orang Asing Mengirim Pesan
+      const pushName = msg.pushName || chatJid;
+      let existingContact = memoryContacts.find(c => c.jid === chatJid);
+      
+      if (!existingContact) {
+        const newContact = { jid: chatJid, name: pushName, custom: false };
+        memoryContacts.push(newContact);
+        
+        if (isDbConnected) {
+          try {
+            await Contact.findOneAndUpdate(
+              { jid: chatJid },
+              { jid: chatJid, name: pushName, custom: false },
+              { upsert: true }
+            );
+          } catch (e) {}
+        }
+        io.emit('contacts-updated');
+      }
+
+      // 2. Simpan Pesan Masuk
       const msgObj = { chatJid, text, fromMe, timestamp: new Date() };
       memoryMessages.push(msgObj);
 
@@ -122,7 +154,12 @@ async function connectToWhatsApp() {
         try { await Message.create(msgObj); } catch(e){}
       }
 
+      // Broadcast pesan secara instant ke Frontend
       io.emit('incoming-message', msgObj);
+      console.log(`[Pesan Masuk] Dari ${chatJid}: ${text}`);
+
+    } catch (err) {
+      console.error('Error handling messages.upsert:', err);
     }
   });
 }
@@ -155,7 +192,7 @@ app.get('/contacts', async (req, res) => {
   if (isDbConnected) {
     try {
       const dbContacts = await Contact.find().sort({ name: 1 });
-      return res.json(dbContacts);
+      if (dbContacts && dbContacts.length > 0) return res.json(dbContacts);
     } catch (err) {}
   }
   res.json(memoryContacts);
@@ -171,11 +208,9 @@ app.post('/contacts', async (req, res) => {
 
   const contactObj = { jid: cleaned, name, custom: true };
 
-  // Update memori lokal
   memoryContacts = memoryContacts.filter(c => c.jid !== cleaned);
   memoryContacts.push(contactObj);
 
-  // Update DB jika terhubung
   if (isDbConnected) {
     try {
       await Contact.findOneAndUpdate(
@@ -196,7 +231,7 @@ app.get('/messages', async (req, res) => {
   if (isDbConnected) {
     try {
       const dbMessages = await Message.find().sort({ timestamp: 1 });
-      return res.json(dbMessages);
+      if (dbMessages && dbMessages.length > 0) return res.json(dbMessages);
     } catch (err) {}
   }
   res.json(memoryMessages);

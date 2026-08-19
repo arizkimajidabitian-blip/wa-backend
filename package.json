@@ -1,16 +1,8 @@
-{
-  "name": "wa-backend",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.5.0",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "mongoose": "^8.0.0",
-    "qrcode": "^1.5.3",
-    "socket.io": "^4.7.5"
-  }
+"dependencies": {
+  "@whiskeysockets/baileys": "^6.6.0",
+  "cors": "^2.8.5",
+  "express": "^4.19.2",
+  "mongoose": "^8.3.0",
+  "qrcode": "^1.5.3",
+  "socket.io": "^4.7.5"
 }

@@ -17,7 +17,6 @@ app.use(cors());
 app.use(express.json());
 
 // KONEKSI MONGO DB
-// Masukkan URI MongoDB Atlas kamu di sini atau lewat Environment Variable MONGO_URI di Railway
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:rahasia123@cluster0.abcde.mongodb.net/wagateway?retryWrites=true&w=majority";
 
 mongoose.connect(MONGO_URI)
@@ -25,8 +24,9 @@ mongoose.connect(MONGO_URI)
   .catch(err => console.error('MongoDB Connection Error:', err));
 
 // Schema Model Pesan
+// 'chatJid' menyimpan nomor lawan bicara (selalu nomor teman chat, bukan nomor kita)
 const MessageSchema = new mongoose.Schema({
-  from: String,
+  chatJid: String,   // Contoh: '628123456789'
   text: String,
   fromMe: Boolean,
   timestamp: { type: Date, default: Date.now }
@@ -39,9 +39,20 @@ const io = new Server(server, {
 
 let sock;
 
+function cleanNumber(jidOrNumber) {
+  if (!jidOrNumber) return '';
+  let cleaned = jidOrNumber.replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/[^0-9]/g, '');
+  if (cleaned.startsWith('0')) cleaned = '62' + cleaned.slice(1);
+  return cleaned;
+}
+
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  sock = makeWASocket({ auth: state, printQRInTerminal: true });
+  sock = makeWASocket({ 
+    auth: state, 
+    printQRInTerminal: true,
+    browser: ["WA Web Lite", "Chrome", "1.0.0"]
+  });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -67,21 +78,34 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Mendengarkan dan menyimpan pesan masuk ke Database
+  // Mendengarkan dan menyimpan pesan masuk/keluar dari WhatsApp
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
-    
-    if (m.type === 'notify') {
-      const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
-      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-      const fromMe = msg.key.fromMe || false;
 
-      if (text) {
-        // Simpan ke MongoDB
-        await Message.create({ from: sender, text, fromMe });
-        // Emit ke UI real-time
-        io.emit('incoming-message', { from: sender, text, fromMe });
+    // Abaikan pesan status/story
+    if (msg.key.remoteJid === 'status@broadcast') return;
+
+    const remoteJid = msg.key.remoteJid || '';
+    const chatJid = cleanNumber(remoteJid);
+    const fromMe = msg.key.fromMe || false;
+
+    // Ambil teks dari berbagai jenis pesan Teks / Balasan / Web
+    const text = 
+      msg.message?.conversation || 
+      msg.message?.extendedTextMessage?.text || 
+      msg.message?.imageMessage?.caption || 
+      '';
+
+    if (text && chatJid) {
+      try {
+        // Simpan ke MongoDB dengan chatJid lawan bicara
+        await Message.create({ chatJid, text, fromMe });
+
+        // Broadcast real-time via Socket.IO ke Frontend
+        io.emit('incoming-message', { chatJid, text, fromMe });
+      } catch (err) {
+        console.error('Gagal simpan pesan:', err);
       }
     }
   });
@@ -100,17 +124,14 @@ app.get('/messages', async (req, res) => {
 // Endpoint Kirim Pesan
 app.post('/send-message', async (req, res) => {
   const { number, message } = req.body;
-  if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap' });
+  if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap / terhubung' });
 
   try {
-    let cleanedNumber = number.replace(/[^0-9]/g, '');
-    if (cleanedNumber.startsWith('0')) cleanedNumber = '62' + cleanedNumber.slice(1);
+    const cleanedNumber = cleanNumber(number);
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
     
+    // Kirim via Baileys (nanti disimpen otomatis lewat event messages.upsert dari WA)
     await sock.sendMessage(recipientJid, { text: message });
-
-    // Simpan pesan keluar ke MongoDB
-    await Message.create({ from: cleanedNumber, text: message, fromMe: true });
 
     res.json({ status: true, message: 'Terkirim' });
   } catch (err) {

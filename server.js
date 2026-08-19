@@ -13,20 +13,25 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-// Enable CORS Total
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 app.use(express.json());
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:rahasia123@cluster0.abcde.mongodb.net/wagateway?retryWrites=true&w=majority";
+// Mengambil variabel MONGO_URI dari Railway
+const MONGO_URI = process.env.MONGO_URI;
+
+if (!MONGO_URI) {
+  console.error("FATAL ERROR: MONGO_URI belum di-set di Railway!");
+}
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully'))
   .catch(err => console.error('MongoDB Connection Error:', err));
 
+// Skema Database
 const MessageSchema = new mongoose.Schema({
-  chatJid: String,
-  text: String,
-  fromMe: Boolean,
+  chatJid: { type: String, required: true },
+  text: { type: String, required: true },
+  fromMe: { type: Boolean, default: false },
   timestamp: { type: Date, default: Date.now }
 });
 const Message = mongoose.model('Message', MessageSchema);
@@ -36,14 +41,6 @@ const ContactSchema = new mongoose.Schema({
   name: String
 });
 const Contact = mongoose.model('Contact', ContactSchema);
-
-const StorySchema = new mongoose.Schema({
-  senderJid: String,
-  senderName: String,
-  text: String,
-  timestamp: { type: Date, default: Date.now }
-});
-const Story = mongoose.model('Story', StorySchema);
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -63,7 +60,7 @@ async function connectToWhatsApp() {
   sock = makeWASocket({ 
     auth: state, 
     printQRInTerminal: true,
-    browser: ["WA Web Lite v3", "Chrome", "1.0.0"],
+    browser: ["WA Web Gateway", "Chrome", "1.0.0"],
     syncFullHistory: true
   });
 
@@ -98,11 +95,7 @@ async function connectToWhatsApp() {
           const cleaned = cleanNumber(c.id);
           const name = c.name || c.notify || c.verifiedName;
           if (cleaned && name) {
-            await Contact.findOneAndUpdate(
-              { jid: cleaned },
-              { name },
-              { upsert: true, new: true }
-            );
+            await Contact.findOneAndUpdate({ jid: cleaned }, { name }, { upsert: true });
           }
         }
       }
@@ -123,26 +116,10 @@ async function connectToWhatsApp() {
           }
         }
       }
-
       io.emit('contacts-updated');
     } catch (err) {
       console.error('Error Sync History:', err);
     }
-  });
-
-  sock.ev.on('contacts.upsert', async (contacts) => {
-    for (const c of contacts) {
-      const cleaned = cleanNumber(c.id);
-      const name = c.name || c.notify || c.verifiedName;
-      if (cleaned && name) {
-        await Contact.findOneAndUpdate(
-          { jid: cleaned },
-          { name },
-          { upsert: true, new: true }
-        );
-      }
-    }
-    io.emit('contacts-updated');
   });
 
   sock.ev.on('messages.upsert', async (m) => {
@@ -150,52 +127,21 @@ async function connectToWhatsApp() {
     if (!msg || !msg.key || !msg.message) return;
 
     const remoteJid = msg.key.remoteJid || '';
-    
-    if (remoteJid === 'status@broadcast') {
-      const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
-      const senderName = msg.pushName || senderJid;
-      const textStory = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
-
-      if (senderJid && textStory) {
-        const newStory = await Story.create({ senderJid, senderName, text: textStory });
-        io.emit('incoming-story', newStory);
-      }
-      return;
-    }
+    if (remoteJid === 'status@broadcast') return;
 
     let chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
-
-    if (!chatJid && sock.user) {
-      chatJid = cleanNumber(sock.user.id);
-    }
-
-    const text = 
-      msg.message?.conversation || 
-      msg.message?.extendedTextMessage?.text || 
-      msg.message?.imageMessage?.caption || 
-      '';
+    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
 
     if (msg.pushName && chatJid) {
-      await Contact.findOneAndUpdate(
-        { jid: chatJid },
-        { name: msg.pushName },
-        { upsert: true }
-      );
+      await Contact.findOneAndUpdate({ jid: chatJid }, { name: msg.pushName }, { upsert: true });
+      io.emit('contacts-updated');
     }
 
     if (text && chatJid) {
       try {
-        const savedMsg = await Message.create({ chatJid, text, fromMe });
-        
-        // SINKRONISASI REALTIME KE SEMUA PERANGKAT
-        io.emit('incoming-message', { 
-          chatJid, 
-          text, 
-          fromMe, 
-          pushName: msg.pushName,
-          timestamp: savedMsg.timestamp 
-        });
+        const saved = await Message.create({ chatJid, text, fromMe });
+        io.emit('incoming-message', { chatJid, text, fromMe, timestamp: saved.timestamp });
       } catch (err) {
         console.error('Gagal simpan pesan:', err);
       }
@@ -203,31 +149,19 @@ async function connectToWhatsApp() {
   });
 }
 
+// API Endpoints
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();
     res.json(contacts);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/messages', async (req, res) => {
   try {
     const history = await Message.find().sort({ timestamp: 1 });
     res.json(history);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/stories', async (req, res) => {
-  try {
-    const stories = await Story.find().sort({ timestamp: -1 }).limit(30);
-    res.json(stories);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/send-message', async (req, res) => {
@@ -239,15 +173,13 @@ app.post('/send-message', async (req, res) => {
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
     
     await sock.sendMessage(recipientJid, { text: message });
+    const saved = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
 
-    // SIMPAN KE MONGO & BROADCAST KE HP & PC
-    const savedMsg = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
-    
     io.emit('incoming-message', { 
       chatJid: cleanedNumber, 
       text: message, 
-      fromMe: true,
-      timestamp: savedMsg.timestamp
+      fromMe: true, 
+      timestamp: saved.timestamp 
     });
 
     res.json({ status: true, message: 'Terkirim' });

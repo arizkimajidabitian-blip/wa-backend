@@ -66,7 +66,7 @@ async function connectToWhatsApp() {
     auth: state, 
     printQRInTerminal: true,
     browser: ["WA Web Lite v2", "Chrome", "1.0.0"],
-    syncFullHistory: true // Paksa WA kirim seluruh history chat & kontak
+    syncFullHistory: true
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -93,12 +93,9 @@ async function connectToWhatsApp() {
     }
   });
 
-  // 1. TANGKAP HISTORY LENGKAP SAAT SCAN QR PERTAMA
-  sock.ev.on('messaging-history.set', async ({ contacts, messages, chats }) => {
+  // 1. Simpan Sinkronisasi Awal dari WA
+  sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
     try {
-      console.log('--- MENERIMA SINKRONISASI HISTORY DARI WA ---');
-      
-      // Simpan Kontak
       if (contacts && contacts.length > 0) {
         for (const c of contacts) {
           const cleaned = cleanNumber(c.id);
@@ -113,12 +110,13 @@ async function connectToWhatsApp() {
         }
       }
 
-      // Simpan Riwayat Pesan
       if (messages && messages.length > 0) {
         for (const msg of messages) {
           if (!msg.key || !msg.message || msg.key.remoteJid === 'status@broadcast') continue;
           
-          const chatJid = cleanNumber(msg.key.remoteJid);
+          let chatJid = cleanNumber(msg.key.remoteJid);
+          if (!chatJid && sock.user) chatJid = cleanNumber(sock.user.id);
+
           const fromMe = msg.key.fromMe || false;
           const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
 
@@ -129,7 +127,6 @@ async function connectToWhatsApp() {
         }
       }
 
-      console.log('--- HISTORY BERHASIL DISIMPAN KE DB ---');
       io.emit('contacts-updated');
     } catch (err) {
       console.error('Error Sync History:', err);
@@ -151,30 +148,38 @@ async function connectToWhatsApp() {
     io.emit('contacts-updated');
   });
 
+  // 2. Handle Pesan Masuk / Keluar / Chat Diri Sendiri
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
 
     const remoteJid = msg.key.remoteJid || '';
-    const text = 
-      msg.message?.conversation || 
-      msg.message?.extendedTextMessage?.text || 
-      msg.message?.imageMessage?.caption || 
-      '';
-
+    
     if (remoteJid === 'status@broadcast') {
       const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
       const senderName = msg.pushName || senderJid;
-      
-      if (senderJid && text) {
-        const newStory = await Story.create({ senderJid, senderName, text });
+      const textStory = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+
+      if (senderJid && textStory) {
+        const newStory = await Story.create({ senderJid, senderName, text: textStory });
         io.emit('incoming-story', newStory);
       }
       return;
     }
 
-    const chatJid = cleanNumber(remoteJid);
+    let chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
+
+    // Jika chat ke nomor sendiri (Note to Self)
+    if (!chatJid && sock.user) {
+      chatJid = cleanNumber(sock.user.id);
+    }
+
+    const text = 
+      msg.message?.conversation || 
+      msg.message?.extendedTextMessage?.text || 
+      msg.message?.imageMessage?.caption || 
+      '';
 
     if (msg.pushName && chatJid) {
       await Contact.findOneAndUpdate(
@@ -195,6 +200,7 @@ async function connectToWhatsApp() {
   });
 }
 
+// Endpoints
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();

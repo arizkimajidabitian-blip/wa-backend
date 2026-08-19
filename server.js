@@ -13,7 +13,8 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-app.use(cors());
+// Enable CORS Total
+app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 app.use(express.json());
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:rahasia123@cluster0.abcde.mongodb.net/wagateway?retryWrites=true&w=majority";
@@ -62,7 +63,7 @@ async function connectToWhatsApp() {
   sock = makeWASocket({ 
     auth: state, 
     printQRInTerminal: true,
-    browser: ["WA Web Lite v2", "Chrome", "1.0.0"],
+    browser: ["WA Web Lite v3", "Chrome", "1.0.0"],
     syncFullHistory: true
   });
 
@@ -187,7 +188,7 @@ async function connectToWhatsApp() {
       try {
         const savedMsg = await Message.create({ chatJid, text, fromMe });
         
-        // EMIT EVENT SINKRONISASI REALTIME KE SEMUA CLIENT (PC & HP)
+        // SINKRONISASI REALTIME KE SEMUA PERANGKAT
         io.emit('incoming-message', { 
           chatJid, 
           text, 
@@ -239,7 +240,7 @@ app.post('/send-message', async (req, res) => {
     
     await sock.sendMessage(recipientJid, { text: message });
 
-    // SIMPAN LANGSUNG KE MONGO & BROADCAST KE SEMUA PERANGKAT
+    // SIMPAN KE MONGO & BROADCAST KE HP & PC
     const savedMsg = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
     
     io.emit('incoming-message', { 

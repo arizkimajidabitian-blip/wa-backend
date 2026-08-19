@@ -13,23 +13,31 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-// Pengaturan CORS & Parsing JSON
 app.use(cors({ origin: "*", methods: ["GET", "POST", "DELETE", "PUT"] }));
 app.use(express.json());
 
-// Ambil MONGO_URI dari Railway Environment Variables
 const MONGO_URI = process.env.MONGO_URI;
 
-if (!MONGO_URI) {
-  console.error("FATAL ERROR: MONGO_URI belum di-set di Environment Variables Railway!");
+let isDbConnected = false;
+
+// Penampung Cadangan (In-Memory Fallback)
+let memoryContacts = [];
+let memoryMessages = [];
+
+if (MONGO_URI) {
+  mongoose.set('bufferCommands', false);
+  mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
+    .then(() => {
+      isDbConnected = true;
+      console.log('MongoDB Atlas Connected Successfully!');
+    })
+    .catch(err => {
+      isDbConnected = false;
+      console.error('MongoDB Connection Error (Running on Fallback Mode):', err.message);
+    });
 }
 
-// Connect ke MongoDB Atlas
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('MongoDB Atlas Connected Successfully'))
-  .catch(err => console.error('MongoDB Connection Error:', err));
-
-// ================= SKEMA & MODEL MONGODB =================
+// ================= SKEMA MONGODB =================
 const MessageSchema = new mongoose.Schema({
   chatJid: { type: String, required: true },
   text: { type: String, required: true },
@@ -45,23 +53,11 @@ const ContactSchema = new mongoose.Schema({
 });
 const Contact = mongoose.model('Contact', ContactSchema);
 
-const StorySchema = new mongoose.Schema({
-  senderJid: String,
-  senderName: String,
-  text: String,
-  timestamp: { type: Date, default: Date.now }
-});
-const Story = mongoose.model('Story', StorySchema);
-
-// Inisialisasi Socket.IO
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
 let sock;
 let lastQR = null;
 
-// Helper Format Nomor Telepon
 function cleanNumber(jidOrNumber) {
   if (!jidOrNumber) return '';
   let cleaned = jidOrNumber.toString().replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/[^0-9]/g, '');
@@ -69,7 +65,6 @@ function cleanNumber(jidOrNumber) {
   return cleaned;
 }
 
-// Fungsi Utama Jalankan Baileys WA
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   
@@ -90,9 +85,7 @@ async function connectToWhatsApp() {
         lastQR = await QRCode.toDataURL(qr);
         io.emit('qr', lastQR);
         io.emit('status', 'Silakan Scan QR Code');
-      } catch (err) {
-        console.error('Error Generating Base64 QR Image:', err);
-      }
+      } catch (err) { console.error('QR Error:', err); }
     }
 
     if (connection === 'open') {
@@ -106,64 +99,8 @@ async function connectToWhatsApp() {
       const reason = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = reason !== DisconnectReason.loggedOut;
       io.emit('status', 'Terputus. Menghubungkan ulang...');
-      console.log(`Koneksi terputus (Reason: ${reason}). Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        setTimeout(connectToWhatsApp, 3000);
-      }
+      if (shouldReconnect) setTimeout(connectToWhatsApp, 3000);
     }
-  });
-
-  sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
-    try {
-      if (contacts && contacts.length > 0) {
-        for (const c of contacts) {
-          const cleaned = cleanNumber(c.id);
-          const name = c.name || c.notify || c.verifiedName;
-          if (cleaned && name) {
-            await Contact.findOneAndUpdate(
-              { jid: cleaned }, 
-              { jid: cleaned, name: name }, 
-              { upsert: true, new: true }
-            );
-          }
-        }
-      }
-
-      if (messages && messages.length > 0) {
-        for (const msg of messages) {
-          if (!msg.key || !msg.message || msg.key.remoteJid === 'status@broadcast') continue;
-          
-          let chatJid = cleanNumber(msg.key.remoteJid);
-          if (!chatJid && sock.user) chatJid = cleanNumber(sock.user.id);
-
-          const fromMe = msg.key.fromMe || false;
-          const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
-
-          if (text && chatJid) {
-            const time = msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date();
-            await Message.create({ chatJid, text, fromMe, timestamp: time });
-          }
-        }
-      }
-      io.emit('contacts-updated');
-    } catch (err) {
-      console.error('Error Sync Messaging History:', err);
-    }
-  });
-
-  sock.ev.on('contacts.upsert', async (contacts) => {
-    for (const c of contacts) {
-      const cleaned = cleanNumber(c.id);
-      const name = c.name || c.notify || c.verifiedName;
-      if (cleaned && name) {
-        await Contact.findOneAndUpdate(
-          { jid: cleaned },
-          { jid: cleaned, name: name },
-          { upsert: true, new: true }
-        );
-      }
-    }
-    io.emit('contacts-updated');
   });
 
   sock.ev.on('messages.upsert', async (m) => {
@@ -171,56 +108,25 @@ async function connectToWhatsApp() {
     if (!msg || !msg.key || !msg.message) return;
 
     const remoteJid = msg.key.remoteJid || '';
-
-    if (remoteJid === 'status@broadcast') {
-      const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
-      const senderName = msg.pushName || senderJid;
-      const textStory = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
-
-      if (senderJid && textStory) {
-        const newStory = await Story.create({ senderJid, senderName, text: textStory });
-        io.emit('incoming-story', newStory);
-      }
-      return;
-    }
+    if (remoteJid === 'status@broadcast') return;
 
     let chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
-
-    if (!chatJid && sock.user) {
-      chatJid = cleanNumber(sock.user.id);
-    }
-
-    const text = 
-      msg.message?.conversation || 
-      msg.message?.extendedTextMessage?.text || 
-      msg.message?.imageMessage?.caption || '';
-
-    if (msg.pushName && chatJid) {
-      const existing = await Contact.findOne({ jid: chatJid });
-      if (!existing) {
-        await Contact.create({ jid: chatJid, name: msg.pushName, custom: false });
-        io.emit('contacts-updated');
-      }
-    }
+    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
 
     if (text && chatJid) {
-      try {
-        const saved = await Message.create({ chatJid, text, fromMe });
-        io.emit('incoming-message', { 
-          chatJid, 
-          text, 
-          fromMe, 
-          timestamp: saved.timestamp 
-        });
-      } catch (err) {
-        console.error('Gagal Menyimpan Pesan Masuk:', err);
+      const msgObj = { chatJid, text, fromMe, timestamp: new Date() };
+      memoryMessages.push(msgObj);
+
+      if (isDbConnected) {
+        try { await Message.create(msgObj); } catch(e){}
       }
+
+      io.emit('incoming-message', msgObj);
     }
   });
 }
 
-// ================= SOCKET.IO HANDLERS =================
 io.on('connection', (socket) => {
   if (sock && sock.user) {
     socket.emit('status', 'Terhubung');
@@ -239,61 +145,61 @@ io.on('connection', (socket) => {
     } else if (sock && sock.user) {
       socket.emit('status', 'Terhubung');
       socket.emit('qr', null);
-    } else {
-      socket.emit('status', 'Menyiapkan QR Code...');
     }
   });
 });
 
-// ================= REST API ENDPOINTS =================
+// ================= API ENDPOINTS =================
 
 app.get('/contacts', async (req, res) => {
-  try {
-    const contacts = await Contact.find().sort({ name: 1 });
-    res.json(contacts);
-  } catch (err) { 
-    res.status(500).json([]); 
+  if (isDbConnected) {
+    try {
+      const dbContacts = await Contact.find().sort({ name: 1 });
+      return res.json(dbContacts);
+    } catch (err) {}
   }
+  res.json(memoryContacts);
 });
 
-// Endpoint Simpan Kontak (Super Anti-Fail)
 app.post('/contacts', async (req, res) => {
-  try {
-    const { number, name } = req.body;
-    let cleaned = cleanNumber(number);
+  const { number, name } = req.body;
+  let cleaned = cleanNumber(number);
 
-    if (!cleaned || !name) {
-      return res.status(400).json({ status: false, message: 'Nomor dan nama wajib diisi!' });
-    }
-
-    // Hapus data lama jika ada bentrok, lalu buat baru
-    await Contact.deleteOne({ jid: cleaned });
-    const newContact = await Contact.create({ jid: cleaned, name: name, custom: true });
-
-    io.emit('contacts-updated');
-    return res.json({ status: true, contact: newContact });
-  } catch (err) {
-    console.error("Gagal simpan kontak:", err);
-    return res.status(500).json({ status: false, message: err.message || "Error Server" });
+  if (!cleaned || !name) {
+    return res.status(400).json({ status: false, message: 'Nomor dan nama wajib diisi!' });
   }
+
+  const contactObj = { jid: cleaned, name, custom: true };
+
+  // Update memori lokal
+  memoryContacts = memoryContacts.filter(c => c.jid !== cleaned);
+  memoryContacts.push(contactObj);
+
+  // Update DB jika terhubung
+  if (isDbConnected) {
+    try {
+      await Contact.findOneAndUpdate(
+        { jid: cleaned },
+        { jid: cleaned, name, custom: true },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.error("Gagal simpan DB Atlas:", err.message);
+    }
+  }
+
+  io.emit('contacts-updated');
+  return res.json({ status: true, contact: contactObj });
 });
 
 app.get('/messages', async (req, res) => {
-  try {
-    const history = await Message.find().sort({ timestamp: 1 });
-    res.json(history);
-  } catch (err) { 
-    res.status(500).json([]); 
+  if (isDbConnected) {
+    try {
+      const dbMessages = await Message.find().sort({ timestamp: 1 });
+      return res.json(dbMessages);
+    } catch (err) {}
   }
-});
-
-app.get('/stories', async (req, res) => {
-  try {
-    const stories = await Story.find().sort({ timestamp: -1 }).limit(30);
-    res.json(stories);
-  } catch (err) { 
-    res.status(500).json([]); 
-  }
+  res.json(memoryMessages);
 });
 
 app.post('/send-message', async (req, res) => {
@@ -305,26 +211,21 @@ app.post('/send-message', async (req, res) => {
 
   try {
     let cleanedNumber = cleanNumber(number);
-    if (!cleanedNumber) {
-      return res.status(400).json({ status: false, message: 'Format nomor telepon tidak valid' });
-    }
+    if (!cleanedNumber) return res.status(400).json({ status: false, message: 'Nomor tidak valid' });
 
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
-    
     await sock.sendMessage(recipientJid, { text: message });
 
-    const saved = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
+    const msgObj = { chatJid: cleanedNumber, text: message, fromMe: true, timestamp: new Date() };
+    memoryMessages.push(msgObj);
 
-    io.emit('incoming-message', { 
-      chatJid: cleanedNumber, 
-      text: message, 
-      fromMe: true, 
-      timestamp: saved.timestamp 
-    });
+    if (isDbConnected) {
+      try { await Message.create(msgObj); } catch(e){}
+    }
 
-    res.json({ status: true, message: 'Pesan Berhasil Terkirim' });
+    io.emit('incoming-message', msgObj);
+    res.json({ status: true, message: 'Terkirim' });
   } catch (err) {
-    console.error('Error Send Message Endpoint:', err);
     res.status(500).json({ status: false, message: err.message });
   }
 });

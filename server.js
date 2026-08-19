@@ -22,7 +22,6 @@ mongoose.connect(MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully'))
   .catch(err => console.error('MongoDB Connection Error:', err));
 
-// Schema Pesan
 const MessageSchema = new mongoose.Schema({
   chatJid: String,
   text: String,
@@ -31,14 +30,12 @@ const MessageSchema = new mongoose.Schema({
 });
 const Message = mongoose.model('Message', MessageSchema);
 
-// Schema Kontak
 const ContactSchema = new mongoose.Schema({
   jid: { type: String, unique: true },
   name: String
 });
 const Contact = mongoose.model('Contact', ContactSchema);
 
-// Schema Story WA
 const StorySchema = new mongoose.Schema({
   senderJid: String,
   senderName: String,
@@ -93,7 +90,6 @@ async function connectToWhatsApp() {
     }
   });
 
-  // 1. Simpan Sinkronisasi Awal dari WA
   sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
     try {
       if (contacts && contacts.length > 0) {
@@ -148,7 +144,6 @@ async function connectToWhatsApp() {
     io.emit('contacts-updated');
   });
 
-  // 2. Handle Pesan Masuk / Keluar / Chat Diri Sendiri
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
@@ -170,7 +165,6 @@ async function connectToWhatsApp() {
     let chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
 
-    // Jika chat ke nomor sendiri (Note to Self)
     if (!chatJid && sock.user) {
       chatJid = cleanNumber(sock.user.id);
     }
@@ -191,8 +185,16 @@ async function connectToWhatsApp() {
 
     if (text && chatJid) {
       try {
-        await Message.create({ chatJid, text, fromMe });
-        io.emit('incoming-message', { chatJid, text, fromMe, pushName: msg.pushName });
+        const savedMsg = await Message.create({ chatJid, text, fromMe });
+        
+        // EMIT EVENT SINKRONISASI REALTIME KE SEMUA CLIENT (PC & HP)
+        io.emit('incoming-message', { 
+          chatJid, 
+          text, 
+          fromMe, 
+          pushName: msg.pushName,
+          timestamp: savedMsg.timestamp 
+        });
       } catch (err) {
         console.error('Gagal simpan pesan:', err);
       }
@@ -200,7 +202,6 @@ async function connectToWhatsApp() {
   });
 }
 
-// Endpoints
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();
@@ -237,6 +238,17 @@ app.post('/send-message', async (req, res) => {
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
     
     await sock.sendMessage(recipientJid, { text: message });
+
+    // SIMPAN LANGSUNG KE MONGO & BROADCAST KE SEMUA PERANGKAT
+    const savedMsg = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
+    
+    io.emit('incoming-message', { 
+      chatJid: cleanedNumber, 
+      text: message, 
+      fromMe: true,
+      timestamp: savedMsg.timestamp
+    });
+
     res.json({ status: true, message: 'Terkirim' });
   } catch (err) {
     res.status(500).json({ status: false, message: err.message });

@@ -14,7 +14,7 @@ const app = express();
 const server = http.createServer(app);
 
 // Pengaturan CORS & Parsing JSON
-app.use(cors({ origin: "*", methods: ["GET", "POST", "DELETE"] }));
+app.use(cors({ origin: "*", methods: ["GET", "POST", "DELETE", "PUT"] }));
 app.use(express.json());
 
 // Ambil MONGO_URI dari Railway Environment Variables
@@ -39,7 +39,7 @@ const MessageSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', MessageSchema);
 
 const ContactSchema = new mongoose.Schema({
-  jid: { type: String, unique: true, required: true },
+  jid: { type: String, required: true },
   name: { type: String, required: true },
   custom: { type: Boolean, default: false }
 });
@@ -123,7 +123,7 @@ async function connectToWhatsApp() {
             await Contact.findOneAndUpdate(
               { jid: cleaned }, 
               { jid: cleaned, name: name }, 
-              { upsert: true, new: true, setDefaultsOnInsert: true }
+              { upsert: true, new: true }
             );
           }
         }
@@ -159,7 +159,7 @@ async function connectToWhatsApp() {
         await Contact.findOneAndUpdate(
           { jid: cleaned },
           { jid: cleaned, name: name },
-          { upsert: true, new: true, setDefaultsOnInsert: true }
+          { upsert: true, new: true }
         );
       }
     }
@@ -256,7 +256,7 @@ app.get('/contacts', async (req, res) => {
   }
 });
 
-// Endpoint Simpan Kontak
+// Endpoint Simpan Kontak (Super Anti-Fail)
 app.post('/contacts', async (req, res) => {
   try {
     const { number, name } = req.body;
@@ -266,17 +266,15 @@ app.post('/contacts', async (req, res) => {
       return res.status(400).json({ status: false, message: 'Nomor dan nama wajib diisi!' });
     }
 
-    const contact = await Contact.findOneAndUpdate(
-      { jid: cleaned },
-      { jid: cleaned, name: name, custom: true },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
+    // Hapus data lama jika ada bentrok, lalu buat baru
+    await Contact.deleteOne({ jid: cleaned });
+    const newContact = await Contact.create({ jid: cleaned, name: name, custom: true });
 
     io.emit('contacts-updated');
-    return res.json({ status: true, contact });
+    return res.json({ status: true, contact: newContact });
   } catch (err) {
     console.error("Gagal simpan kontak:", err);
-    return res.status(500).json({ status: false, message: err.message });
+    return res.status(500).json({ status: false, message: err.message || "Error Server" });
   }
 });
 

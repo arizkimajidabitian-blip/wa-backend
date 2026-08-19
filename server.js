@@ -16,7 +16,7 @@ const server = http.createServer(app);
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 app.use(express.json());
 
-// Mengambil variabel MONGO_URI dari Railway
+// Ambil MONGO_URI dari Environment Variables Railway
 const MONGO_URI = process.env.MONGO_URI;
 
 if (!MONGO_URI) {
@@ -27,7 +27,7 @@ mongoose.connect(MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully'))
   .catch(err => console.error('MongoDB Connection Error:', err));
 
-// Skema Database
+// Skema Database MongoDB
 const MessageSchema = new mongoose.Schema({
   chatJid: { type: String, required: true },
   text: { type: String, required: true },
@@ -47,6 +47,7 @@ const io = new Server(server, {
 });
 
 let sock;
+let lastQR = null; // Penampung QR Code Instan
 
 function cleanNumber(jidOrNumber) {
   if (!jidOrNumber) return '';
@@ -70,12 +71,13 @@ async function connectToWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      const qrBase64 = await QRCode.toDataURL(qr);
-      io.emit('qr', qrBase64);
+      lastQR = await QRCode.toDataURL(qr);
+      io.emit('qr', lastQR);
       io.emit('status', 'Silakan Scan QR Code');
     }
 
     if (connection === 'open') {
+      lastQR = null;
       io.emit('status', 'Terhubung');
       io.emit('qr', null);
     }
@@ -149,7 +151,30 @@ async function connectToWhatsApp() {
   });
 }
 
-// API Endpoints
+// Socket handler untuk koneksi instan
+io.on('connection', (socket) => {
+  if (sock && sock.user) {
+    socket.emit('status', 'Terhubung');
+    socket.emit('qr', null);
+  } else {
+    socket.emit('status', lastQR ? 'Silakan Scan QR Code' : 'Menyiapkan QR Code...');
+    if (lastQR) socket.emit('qr', lastQR);
+  }
+
+  socket.on('request-qr', () => {
+    if (lastQR) {
+      socket.emit('qr', lastQR);
+      socket.emit('status', 'Silakan Scan QR Code');
+    } else if (sock && sock.user) {
+      socket.emit('status', 'Terhubung');
+      socket.emit('qr', null);
+    } else {
+      socket.emit('status', 'Menyiapkan QR Code...');
+    }
+  });
+});
+
+// REST API Endpoints
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();

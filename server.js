@@ -31,12 +31,21 @@ const MessageSchema = new mongoose.Schema({
 });
 const Message = mongoose.model('Message', MessageSchema);
 
-// Schema Kontak (Baru!)
+// Schema Kontak
 const ContactSchema = new mongoose.Schema({
-  jid: { type: String, unique: true }, // Contoh: 628123456789
+  jid: { type: String, unique: true },
   name: String
 });
 const Contact = mongoose.model('Contact', ContactSchema);
+
+// Schema Story WA (Baru!)
+const StorySchema = new mongoose.Schema({
+  senderJid: String,
+  senderName: String,
+  text: String,
+  timestamp: { type: Date, default: Date.now }
+});
+const Story = mongoose.model('Story', StorySchema);
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -56,7 +65,8 @@ async function connectToWhatsApp() {
   sock = makeWASocket({ 
     auth: state, 
     printQRInTerminal: true,
-    browser: ["WA Web Lite", "Chrome", "1.0.0"]
+    browser: ["WA Web Lite", "Chrome", "1.0.0"],
+    syncFullHistory: true
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -83,7 +93,7 @@ async function connectToWhatsApp() {
     }
   });
 
-  // 1. Simpan Kontak dari Sinkronisasi Awal WA (Saat Scan)
+  // Simpan Kontak dari WA HP
   sock.ev.on('messaging-history.set', async ({ contacts }) => {
     if (contacts && contacts.length > 0) {
       for (const c of contacts) {
@@ -101,7 +111,6 @@ async function connectToWhatsApp() {
     }
   });
 
-  // 2. Simpan Kontak yang Baru Masuk/Diupdate
   sock.ev.on('contacts.upsert', async (contacts) => {
     for (const c of contacts) {
       const cleaned = cleanNumber(c.id);
@@ -117,17 +126,38 @@ async function connectToWhatsApp() {
     io.emit('contacts-updated');
   });
 
-  // 3. Simpan Pesan dan Nama Pengirim
+  // Handle Pesan Masuk & Story WA
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
-    if (msg.key.remoteJid === 'status@broadcast') return;
 
     const remoteJid = msg.key.remoteJid || '';
+    const text = 
+      msg.message?.conversation || 
+      msg.message?.extendedTextMessage?.text || 
+      msg.message?.imageMessage?.caption || 
+      '';
+
+    // 1. TANGKAP STORY WA (status@broadcast)
+    if (remoteJid === 'status@broadcast') {
+      const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
+      const senderName = msg.pushName || senderJid;
+      
+      if (senderJid && text) {
+        const newStory = await Story.create({
+          senderJid,
+          senderName,
+          text
+        });
+        io.emit('incoming-story', newStory);
+      }
+      return;
+    }
+
+    // 2. TANGKAP PESAN BIASA
     const chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
 
-    // Jika pesan membawa nama pushName/notifyName pengirim, simpan ke Kontak
     if (msg.pushName && chatJid) {
       await Contact.findOneAndUpdate(
         { jid: chatJid },
@@ -135,12 +165,6 @@ async function connectToWhatsApp() {
         { upsert: true }
       );
     }
-
-    const text = 
-      msg.message?.conversation || 
-      msg.message?.extendedTextMessage?.text || 
-      msg.message?.imageMessage?.caption || 
-      '';
 
     if (text && chatJid) {
       try {
@@ -153,7 +177,7 @@ async function connectToWhatsApp() {
   });
 }
 
-// Endpoint Ambil Daftar Kontak
+// Endpoints
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();
@@ -172,9 +196,19 @@ app.get('/messages', async (req, res) => {
   }
 });
 
+// Endpoint Ambil Story WA
+app.get('/stories', async (req, res) => {
+  try {
+    const stories = await Story.find().sort({ timestamp: -1 }).limit(30);
+    res.json(stories);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/send-message', async (req, res) => {
   const { number, message } = req.body;
-  if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap / terhubung' });
+  if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap' });
 
   try {
     const cleanedNumber = cleanNumber(number);

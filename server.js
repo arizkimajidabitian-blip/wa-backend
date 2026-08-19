@@ -38,7 +38,7 @@ const ContactSchema = new mongoose.Schema({
 });
 const Contact = mongoose.model('Contact', ContactSchema);
 
-// Schema Story WA (Baru!)
+// Schema Story WA
 const StorySchema = new mongoose.Schema({
   senderJid: String,
   senderName: String,
@@ -65,8 +65,8 @@ async function connectToWhatsApp() {
   sock = makeWASocket({ 
     auth: state, 
     printQRInTerminal: true,
-    browser: ["WA Web Lite", "Chrome", "1.0.0"],
-    syncFullHistory: true
+    browser: ["WA Web Lite v2", "Chrome", "1.0.0"],
+    syncFullHistory: true // Paksa WA kirim seluruh history chat & kontak
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -93,21 +93,46 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Simpan Kontak dari WA HP
-  sock.ev.on('messaging-history.set', async ({ contacts }) => {
-    if (contacts && contacts.length > 0) {
-      for (const c of contacts) {
-        const cleaned = cleanNumber(c.id);
-        const name = c.name || c.notify || c.verifiedName;
-        if (cleaned && name) {
-          await Contact.findOneAndUpdate(
-            { jid: cleaned },
-            { name },
-            { upsert: true, new: true }
-          );
+  // 1. TANGKAP HISTORY LENGKAP SAAT SCAN QR PERTAMA
+  sock.ev.on('messaging-history.set', async ({ contacts, messages, chats }) => {
+    try {
+      console.log('--- MENERIMA SINKRONISASI HISTORY DARI WA ---');
+      
+      // Simpan Kontak
+      if (contacts && contacts.length > 0) {
+        for (const c of contacts) {
+          const cleaned = cleanNumber(c.id);
+          const name = c.name || c.notify || c.verifiedName;
+          if (cleaned && name) {
+            await Contact.findOneAndUpdate(
+              { jid: cleaned },
+              { name },
+              { upsert: true, new: true }
+            );
+          }
         }
       }
+
+      // Simpan Riwayat Pesan
+      if (messages && messages.length > 0) {
+        for (const msg of messages) {
+          if (!msg.key || !msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+          
+          const chatJid = cleanNumber(msg.key.remoteJid);
+          const fromMe = msg.key.fromMe || false;
+          const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+
+          if (text && chatJid) {
+            const time = msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date();
+            await Message.create({ chatJid, text, fromMe, timestamp: time });
+          }
+        }
+      }
+
+      console.log('--- HISTORY BERHASIL DISIMPAN KE DB ---');
       io.emit('contacts-updated');
+    } catch (err) {
+      console.error('Error Sync History:', err);
     }
   });
 
@@ -126,7 +151,6 @@ async function connectToWhatsApp() {
     io.emit('contacts-updated');
   });
 
-  // Handle Pesan Masuk & Story WA
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
@@ -138,23 +162,17 @@ async function connectToWhatsApp() {
       msg.message?.imageMessage?.caption || 
       '';
 
-    // 1. TANGKAP STORY WA (status@broadcast)
     if (remoteJid === 'status@broadcast') {
       const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
       const senderName = msg.pushName || senderJid;
       
       if (senderJid && text) {
-        const newStory = await Story.create({
-          senderJid,
-          senderName,
-          text
-        });
+        const newStory = await Story.create({ senderJid, senderName, text });
         io.emit('incoming-story', newStory);
       }
       return;
     }
 
-    // 2. TANGKAP PESAN BIASA
     const chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
 
@@ -177,7 +195,6 @@ async function connectToWhatsApp() {
   });
 }
 
-// Endpoints
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();
@@ -196,7 +213,6 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// Endpoint Ambil Story WA
 app.get('/stories', async (req, res) => {
   try {
     const stories = await Story.find().sort({ timestamp: -1 }).limit(30);

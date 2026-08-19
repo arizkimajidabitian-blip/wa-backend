@@ -13,21 +13,23 @@ const {
 const app = express();
 const server = http.createServer(app);
 
+// Pengaturan CORS & JSON Middleware
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 app.use(express.json());
 
-// Ambil MONGO_URI dari Environment Variables Railway
+// Mengambil variabel MONGO_URI dari Environment Railway
 const MONGO_URI = process.env.MONGO_URI;
 
 if (!MONGO_URI) {
-  console.error("FATAL ERROR: MONGO_URI belum di-set di Railway!");
+  console.error("FATAL ERROR: MONGO_URI belum di-set di Environment Variables Railway!");
 }
 
+// Koneksi ke MongoDB Atlas
 mongoose.connect(MONGO_URI)
-  .then(() => console.log('MongoDB Connected Successfully'))
+  .then(() => console.log('MongoDB Atlas Connected Successfully'))
   .catch(err => console.error('MongoDB Connection Error:', err));
 
-// Skema Database MongoDB
+// ================= SKEMA & MODEL MONGODB =================
 const MessageSchema = new mongoose.Schema({
   chatJid: { type: String, required: true },
   text: { type: String, required: true },
@@ -42,13 +44,23 @@ const ContactSchema = new mongoose.Schema({
 });
 const Contact = mongoose.model('Contact', ContactSchema);
 
+const StorySchema = new mongoose.Schema({
+  senderJid: String,
+  senderName: String,
+  text: String,
+  timestamp: { type: Date, default: Date.now }
+});
+const Story = mongoose.model('Story', StorySchema);
+
+// Inisialisasi Socket.IO Server
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 let sock;
-let lastQR = null; // Penampung QR Code Instan
+let lastQR = null; // Penampung QR Code Instan (Base64)
 
+// Fungsi Sanitasi dan Normalisasi Nomor Telepon
 function cleanNumber(jidOrNumber) {
   if (!jidOrNumber) return '';
   let cleaned = jidOrNumber.replace('@s.whatsapp.net', '').replace('@g.us', '').replace(/[^0-9]/g, '');
@@ -56,40 +68,52 @@ function cleanNumber(jidOrNumber) {
   return cleaned;
 }
 
+// Fungsi Utama Koneksi WhatsApp (Baileys)
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  
   sock = makeWASocket({ 
     auth: state, 
     printQRInTerminal: true,
-    browser: ["WA Web Gateway", "Chrome", "1.0.0"],
+    browser: ["WA Gateway Pro", "Chrome", "1.0.0"],
     syncFullHistory: true
   });
 
   sock.ev.on('creds.update', saveCreds);
 
+  // Update Status Koneksi & QR Code
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      lastQR = await QRCode.toDataURL(qr);
-      io.emit('qr', lastQR);
-      io.emit('status', 'Silakan Scan QR Code');
+      try {
+        lastQR = await QRCode.toDataURL(qr);
+        io.emit('qr', lastQR);
+        io.emit('status', 'Silakan Scan QR Code');
+      } catch (err) {
+        console.error('Error Generating Base64 QR Image:', err);
+      }
     }
 
     if (connection === 'open') {
-      lastQR = null;
+      lastQR = null; // Hapus penampung QR jika sudah terkoneksi
       io.emit('status', 'Terhubung');
       io.emit('qr', null);
+      console.log('WhatsApp Gateway Online & Terhubung!');
     }
 
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = reason !== DisconnectReason.loggedOut;
       io.emit('status', 'Terputus. Menghubungkan ulang...');
-      if (shouldReconnect) connectToWhatsApp();
+      console.log(`Koneksi terputus (Reason: ${reason}). Reconnecting: ${shouldReconnect}`);
+      if (shouldReconnect) {
+        setTimeout(connectToWhatsApp, 3000);
+      }
     }
   });
 
+  // Sinkronisasi Riwayat Chat & Kontak Otomatis Saat Pertama Kali Login
   sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
     try {
       if (contacts && contacts.length > 0) {
@@ -120,45 +144,87 @@ async function connectToWhatsApp() {
       }
       io.emit('contacts-updated');
     } catch (err) {
-      console.error('Error Sync History:', err);
+      console.error('Error Sync Messaging History:', err);
     }
   });
 
+  // Penambahan Kontak Baru Secara Otomatis
+  sock.ev.on('contacts.upsert', async (contacts) => {
+    for (const c of contacts) {
+      const cleaned = cleanNumber(c.id);
+      const name = c.name || c.notify || c.verifiedName;
+      if (cleaned && name) {
+        await Contact.findOneAndUpdate({ jid: cleaned }, { name }, { upsert: true });
+      }
+    }
+    io.emit('contacts-updated');
+  });
+
+  // Penanganan Pesan Masuk & Status/Story WhatsApp
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg || !msg.key || !msg.message) return;
 
     const remoteJid = msg.key.remoteJid || '';
-    if (remoteJid === 'status@broadcast') return;
+    
+    // Fitur Tangkap Status / Story WA Orang Lain
+    if (remoteJid === 'status@broadcast') {
+      const senderJid = cleanNumber(msg.key.participant || msg.participant || '');
+      const senderName = msg.pushName || senderJid;
+      const textStory = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+
+      if (senderJid && textStory) {
+        const newStory = await Story.create({ senderJid, senderName, text: textStory });
+        io.emit('incoming-story', newStory);
+      }
+      return;
+    }
 
     let chatJid = cleanNumber(remoteJid);
     const fromMe = msg.key.fromMe || false;
-    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
 
+    if (!chatJid && sock.user) {
+      chatJid = cleanNumber(sock.user.id);
+    }
+
+    const text = 
+      msg.message?.conversation || 
+      msg.message?.extendedTextMessage?.text || 
+      msg.message?.imageMessage?.caption || '';
+
+    // Simpan Kontak Jika Ada PushName
     if (msg.pushName && chatJid) {
       await Contact.findOneAndUpdate({ jid: chatJid }, { name: msg.pushName }, { upsert: true });
       io.emit('contacts-updated');
     }
 
+    // Simpan Pesan ke DB & Broadcast Real-Time ke Frontend
     if (text && chatJid) {
       try {
         const saved = await Message.create({ chatJid, text, fromMe });
-        io.emit('incoming-message', { chatJid, text, fromMe, timestamp: saved.timestamp });
+        io.emit('incoming-message', { 
+          chatJid, 
+          text, 
+          fromMe, 
+          timestamp: saved.timestamp 
+        });
       } catch (err) {
-        console.error('Gagal simpan pesan:', err);
+        console.error('Gagal Menyimpan Pesan Masuk:', err);
       }
     }
   });
 }
 
-// Socket handler untuk koneksi instan
+// ================= SOCKET.IO HANDLERS =================
 io.on('connection', (socket) => {
   if (sock && sock.user) {
     socket.emit('status', 'Terhubung');
     socket.emit('qr', null);
+  } else if (lastQR) {
+    socket.emit('qr', lastQR);
+    socket.emit('status', 'Silakan Scan QR Code');
   } else {
-    socket.emit('status', lastQR ? 'Silakan Scan QR Code' : 'Menyiapkan QR Code...');
-    if (lastQR) socket.emit('qr', lastQR);
+    socket.emit('status', 'Menyiapkan QR Code...');
   }
 
   socket.on('request-qr', () => {
@@ -174,32 +240,61 @@ io.on('connection', (socket) => {
   });
 });
 
-// REST API Endpoints
+// ================= REST API ENDPOINTS =================
+
+// Get Semua Daftar Kontak
 app.get('/contacts', async (req, res) => {
   try {
     const contacts = await Contact.find();
     res.json(contacts);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
+// Get Semua Riwayat Pesan
 app.get('/messages', async (req, res) => {
   try {
     const history = await Message.find().sort({ timestamp: 1 });
     res.json(history);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
+// Get Riwayat Story / Status WA
+app.get('/stories', async (req, res) => {
+  try {
+    const stories = await Story.find().sort({ timestamp: -1 }).limit(30);
+    res.json(stories);
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+// Endpoint Kirim Pesan
 app.post('/send-message', async (req, res) => {
   const { number, message } = req.body;
-  if (!sock) return res.status(500).json({ status: false, message: 'WA belum siap' });
+
+  if (!sock) {
+    return res.status(500).json({ status: false, message: 'WhatsApp belum terhubung' });
+  }
 
   try {
-    const cleanedNumber = cleanNumber(number);
+    let cleanedNumber = cleanNumber(number);
+    if (!cleanedNumber) {
+      return res.status(400).json({ status: false, message: 'Format nomor telepon tidak valid' });
+    }
+
     const recipientJid = `${cleanedNumber}@s.whatsapp.net`;
     
+    // Kirim via Baileys
     await sock.sendMessage(recipientJid, { text: message });
+
+    // Simpan ke DB
     const saved = await Message.create({ chatJid: cleanedNumber, text: message, fromMe: true });
 
+    // Broadcast Real-Time ke Semua Klien (HP & PC)
     io.emit('incoming-message', { 
       chatJid: cleanedNumber, 
       text: message, 
@@ -207,13 +302,16 @@ app.post('/send-message', async (req, res) => {
       timestamp: saved.timestamp 
     });
 
-    res.json({ status: true, message: 'Terkirim' });
+    res.json({ status: true, message: 'Pesan Berhasil Terkirim' });
   } catch (err) {
+    console.error('Error Send Message Endpoint:', err);
     res.status(500).json({ status: false, message: err.message });
   }
 });
 
+// Menjalankan HTTP & Socket Server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
+  console.log(`Server Gateway Aktif di Port: ${PORT}`);
   connectToWhatsApp();
 });
